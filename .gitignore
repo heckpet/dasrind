@@ -3,5 +3,8 @@
 github_token.txt
 *.token
 
+# Projektspezifische Assets - das Repo dient als generisches Beispiel
+logorind.svg
+
 # macOS
 .DS_Store

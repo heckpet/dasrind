@@ -1,0 +1,7 @@
+# Zugangsdaten - niemals committen
+.github_token
+github_token.txt
+*.token
+
+# macOS
+.DS_Store

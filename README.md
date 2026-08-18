@@ -5,7 +5,7 @@ Diese Dateien holen Veranstaltungstermine aus dem XML-Feed von
 [Etch](https://etchwp.com) als Dynamic Data zur Verfügung — für Programm-Loops,
 Detailseiten, Kategoriefilter, Presse-Bilddownloads und iCal-Export.
 
-Im Einsatz auf [dasrind.de](https://dasrind.de).
+Demnächst im Einsatz auf [dasrind.de](https://dasrind.de).
 
 ## Dateien
 

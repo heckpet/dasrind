@@ -682,6 +682,48 @@ add_filter( 'etch/dynamic_data/option', function ( $data ) {
 // 7. iCAL ENDPOINT (deine-seite.de/?hessens_ical=EVENT-SLUG)
 // =============================================================================
 
+/**
+ * Escaped einen Textwert nach RFC 5545: Backslash, Semikolon, Komma und
+ * Zeilenumbrueche muessen maskiert werden, sonst zerlegen Kalender-Clients
+ * das Feld an der falschen Stelle.
+ */
+function hessens_ical_escape( $text ) {
+    $text = wp_strip_all_tags( (string) $text );
+    $text = str_replace( array( "\r\n", "\r" ), "\n", $text );
+    return str_replace(
+        array( '\\',   ';',   ',',   "\n" ),
+        array( '\\\\', '\\;', '\\,', '\\n' ),
+        $text
+    );
+}
+
+/**
+ * Faltet eine Content-Line auf max. 75 Oktette (RFC 5545, "content line
+ * folding"). Folgezeilen beginnen mit einem Leerzeichen. UTF-8-Zeichen
+ * werden nie mittendrin getrennt.
+ */
+function hessens_ical_fold( $line ) {
+    $out   = '';
+    $chunk = '';
+    $bytes = 0;
+    $limit = 74; // 74 Oktette + CRLF; Folgezeilen zaehlen das Leerzeichen mit
+    $len   = mb_strlen( $line, 'UTF-8' );
+
+    for ( $i = 0; $i < $len; $i++ ) {
+        $char       = mb_substr( $line, $i, 1, 'UTF-8' );
+        $char_bytes = strlen( $char );
+        if ( $bytes + $char_bytes > $limit ) {
+            $out  .= $chunk . "\r\n";
+            $chunk = ' ';
+            $bytes = 1;
+        }
+        $chunk .= $char;
+        $bytes += $char_bytes;
+    }
+
+    return $out . $chunk . "\r\n";
+}
+
 add_action( 'init', function () {
     if ( isset( $_GET['hessens_ical'] ) && ! empty( $_GET['hessens_ical'] ) ) {
         $requested_slug = sanitize_title( $_GET['hessens_ical'] );
@@ -699,12 +741,33 @@ add_action( 'init', function () {
             wp_die( 'Event nicht gefunden.' );
         }
 
-        // Datum + Zeit für iCAL formatieren (YYYYMMDDTHHmmssZ)
-        $start_datetime = gmdate( 'Ymd\THis\Z', strtotime( $event['date_raw'] . ' ' . $event['start_time'] ) );
-        // Ende: 3 Stunden nach Beginn als Schätzwert
-        $end_datetime   = gmdate( 'Ymd\THis\Z', strtotime( $event['date_raw'] . ' ' . $event['start_time'] ) + 3 * HOUR_IN_SECONDS );
+        // Datum + Zeit fuer iCAL formatieren (YYYYMMDDTHHmmssZ, also echte UTC).
+        //
+        // ACHTUNG - haeufige Fehlerquelle: WordPress setzt PHPs Default-Zeitzone
+        // auf UTC. Ein `strtotime( '2026-08-24 20:00' )` liest die Ortszeit
+        // deshalb als UTC, und `gmdate( ... 'Z' )` stempelt sie erneut als UTC -
+        // der Termin landet im Kalender um den Berlin-Offset verschoben
+        // (Sommerzeit +2 h, Winterzeit +1 h). Die Ortszeit muss daher explizit
+        // in der Site-Zeitzone konstruiert und danach nach UTC konvertiert
+        // werden.
+        $site_tz = wp_timezone(); // aus den WordPress-Einstellungen, DST-sicher
+        try {
+            $start_local = new DateTimeImmutable(
+                $event['date_raw'] . ' ' . $event['start_time'],
+                $site_tz
+            );
+        } catch ( Exception $e ) {
+            wp_die( 'Ungueltige Datums-/Zeitangabe im Feed.' );
+        }
+        // Ende: 3 Stunden nach Beginn als Schaetzwert
+        $end_local = $start_local->modify( '+3 hours' );
+
+        $utc            = new DateTimeZone( 'UTC' );
+        $start_datetime = $start_local->setTimezone( $utc )->format( 'Ymd\THis\Z' );
+        $end_datetime   = $end_local->setTimezone( $utc )->format( 'Ymd\THis\Z' );
 
         $location = trim( $event['location_name'] . ', ' . $event['location_street'] . ', ' . $event['location_city'] );
+        $location = trim( $location, " ,\t\n\r\0\x0B" );
         $uid      = $event['id'] . '@dasrind.de';
 
         $ics = "BEGIN:VCALENDAR\r\n";
@@ -717,9 +780,9 @@ add_action( 'init', function () {
         $ics .= "DTSTAMP:" . gmdate( 'Ymd\THis\Z' ) . "\r\n";
         $ics .= "DTSTART:" . $start_datetime . "\r\n";
         $ics .= "DTEND:" . $end_datetime . "\r\n";
-        $ics .= "SUMMARY:" . $event['title'] . "\r\n";
-        $ics .= "DESCRIPTION:" . wp_strip_all_tags( $event['description'] ) . "\r\n";
-        $ics .= "LOCATION:" . $location . "\r\n";
+        $ics .= hessens_ical_fold( 'SUMMARY:' . hessens_ical_escape( $event['title'] ) );
+        $ics .= hessens_ical_fold( 'DESCRIPTION:' . hessens_ical_escape( $event['description'] ) );
+        $ics .= hessens_ical_fold( 'LOCATION:' . hessens_ical_escape( $location ) );
         $ics .= "END:VEVENT\r\n";
         $ics .= "END:VCALENDAR\r\n";
 

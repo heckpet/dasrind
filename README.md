@@ -203,3 +203,16 @@ Erzeugte Klassen zum Stylen: `.event-filter-buttons`, `.event-filter-btn` und
 
 `/?hessens_ical=EVENT-SLUG` liefert eine `.ics`-Datei zum Eintragen in den
 Kalender. Die Dauer wird pauschal mit 3 Stunden ab Beginn angesetzt.
+
+`DTSTART`/`DTEND` stehen in echter UTC (`…Z`). Die Ortszeit aus dem Feed wird
+dafür explizit in der Zeitzone aus den WordPress-Einstellungen (`wp_timezone()`)
+konstruiert und dann nach UTC konvertiert — Sommer-/Winterzeit inklusive.
+
+> **Stolperfalle:** WordPress setzt PHPs Default-Zeitzone auf UTC. Ein
+> `gmdate( 'Ymd\THis\Z', strtotime( '2026-08-24 20:00' ) )` liest die Ortszeit
+> deshalb als UTC und stempelt sie erneut als UTC — der Termin landet im
+> Kalender um den lokalen Offset verschoben (im Sommer +2 h). Genau dieser
+> Fehler steckte bis 2026-08-21 im Export.
+
+Text-Felder (`SUMMARY`, `DESCRIPTION`, `LOCATION`) werden nach RFC 5545
+escaped (`\,` `\;` `\\` `\n`) und auf 75 Oktette pro Zeile gefaltet.

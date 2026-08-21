@@ -147,31 +147,60 @@ function hessens_fetch_events( $force = false ) {
         // Die low-res Datei wird im Hintergrund erzeugt (siehe Abschnitt 1b).
         // Solange sie noch nicht existiert, liefert image{N}_url als Fallback
         // das Original aus, damit nie ein kaputtes Bild angezeigt wird.
+        //
+        // WICHTIG - die Slot-Nummer bleibt erhalten:
+        //   Image1 = Hochformat (Portrait), ist nicht immer vorhanden.
+        //   Image2 = Querformat (Landscape), wird immer gepflegt.
+        // Die XML-Nummerierung hat also Luecken: ein Event kann <Image2>
+        // liefern, ohne dass <Image1> existiert. Es wird NICHT umnummeriert -
+        // Image2 bleibt image2. Fehlende Slots werden als leere Strings
+        // ausgegeben, damit die Felder in Etch immer existieren.
+        //
+        // Zusaetzlich liefert image_main_* das erste tatsaechlich vorhandene
+        // Bild (Portrait bevorzugt, sonst Landscape) - dieses Feld ist fuer
+        // die Anzeige in Programmuebersicht/Karten gedacht, damit nie ein
+        // leeres src entsteht.
         $image_fields = array();
-        $i = 1;
-        while ( isset( $event->{'Image' . $i} ) ) {
-            $img_node  = $event->{'Image' . $i};
-            $img_path  = (string) $img_node->PublicUrl;
-            $url_key   = 'image' . $i . '_url';        // low-res (Anzeige)
-            $hires_key = 'image' . $i . '_url_hires';  // Original (Presse-Download)
-            $name_key  = 'image' . $i . '_filename';
-            if ( ! empty( $img_path ) ) {
-                $original_url = $image_base . $img_path;
-                $image_fields[ $hires_key ] = $original_url;
-                $image_fields[ $url_key ]   = hessens_lowres_display_url( $original_url );
-                $image_fields[ $name_key ]  = basename( $img_path );
-            } else {
-                $image_fields[ $hires_key ] = '';
-                $image_fields[ $url_key ]   = '';
-                $image_fields[ $name_key ]  = '';
+        $img_paths    = array();
+        $max_slot     = 2; // mind. Slot 1 und 2 immer ausgeben
+        foreach ( $event->children() as $child ) {
+            if ( ! preg_match( '/^Image(\d+)$/', $child->getName(), $m ) ) {
+                continue;
             }
-            $i++;
+            $slot = (int) $m[1];
+            if ( $slot < 1 ) {
+                continue;
+            }
+            $max_slot = max( $max_slot, $slot );
+            $img_path = trim( (string) $child->PublicUrl );
+            if ( '' !== $img_path ) {
+                $img_paths[ $slot ] = $img_path;
+            }
         }
-        if ( ! isset( $image_fields['image1_url'] ) ) {
-            $image_fields['image1_url']       = '';
-            $image_fields['image1_url_hires'] = '';
-            $image_fields['image1_filename']  = '';
+
+        $main_url = $main_hires = $main_name = '';
+        for ( $i = 1; $i <= $max_slot; $i++ ) {
+            if ( isset( $img_paths[ $i ] ) ) {
+                $img_path     = $img_paths[ $i ];
+                $original_url = $image_base . $img_path;
+                $image_fields[ 'image' . $i . '_url_hires' ] = $original_url;                              // Original (Presse-Download)
+                $image_fields[ 'image' . $i . '_url' ]       = hessens_lowres_display_url( $original_url ); // low-res (Anzeige)
+                $image_fields[ 'image' . $i . '_filename' ]  = basename( $img_path );
+                if ( '' === $main_url ) {
+                    $main_url   = $image_fields[ 'image' . $i . '_url' ];
+                    $main_hires = $image_fields[ 'image' . $i . '_url_hires' ];
+                    $main_name  = $image_fields[ 'image' . $i . '_filename' ];
+                }
+            } else {
+                $image_fields[ 'image' . $i . '_url_hires' ] = '';
+                $image_fields[ 'image' . $i . '_url' ]       = '';
+                $image_fields[ 'image' . $i . '_filename' ]  = '';
+            }
         }
+
+        $image_fields['image_main_url']       = $main_url;
+        $image_fields['image_main_url_hires'] = $main_hires;
+        $image_fields['image_main_filename']  = $main_name;
 
         // Location
         $location_name   = '';

@@ -140,9 +140,21 @@ Etch unter *Loop → Source: JSON Data → URL* eintragen.
 | `imageN_url` | Anzeige-Variante, max. 800 px |
 | `imageN_url_hires` | Original aus dem Feed, für den Presse-Download |
 | `imageN_filename` | Original-Dateiname |
+| `image_main_url` | Anzeige-Variante des ersten vorhandenen Bildes |
+| `image_main_url_hires` | Original des ersten vorhandenen Bildes |
+| `image_main_filename` | Dateiname des ersten vorhandenen Bildes |
 
-Die Bildfelder sind ab `image1_…` durchnummeriert, so viele wie der Feed
-liefert. `image1_…` existiert immer, auch wenn kein Bild vorhanden ist.
+Die Bildfelder behalten die **Slot-Nummer aus dem Feed**: `image1_…` ist das
+Hochformat (nicht immer gepflegt), `image2_…` das Querformat (immer gepflegt).
+Der Feed liefert diese Slots mit Lücken — ein Event kann `<Image2>` enthalten,
+ohne dass `<Image1>` existiert. Es wird deshalb **nicht umnummeriert**;
+fehlende Slots kommen als leerer String, damit die Felder in Etch immer
+existieren. `image1_…` und `image2_…` gibt es immer, weitere Slots nur, wenn
+der Feed sie liefert.
+
+Für die Anzeige (Programmübersicht, Karten) gibt es zusätzlich `image_main_…`:
+das erste tatsächlich vorhandene Bild, also Hochformat wenn gepflegt, sonst
+Querformat. So entsteht nie ein leeres `src`.
 
 ## Bildvarianten
 

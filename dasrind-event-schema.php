@@ -6,7 +6,7 @@
  *              der Programmübersicht), setzt auf der Detailseite Canonical,
  *              Titel und Description pro Termin über die SEOPress-Filter und
  *              stellt sprechende URLs /event-detail/SLUG/ bereit.
- * Version:     1.6
+ * Version:     1.7
  * Author:      Webdesign Rheingau
  *
  * Ablage: wp-content/mu-plugins/dasrind-event-schema.php
@@ -94,6 +94,21 @@ const DASRIND_SCHEMA_EXPIRED_REDIRECT = true;
 /** Slug der Seite, auf der abgelaufene Termine landen. */
 const DASRIND_SCHEMA_EXPIRED_TARGET_SLUG = 'programm';
 
+/**
+ * Erstsichtung der Termine: Der hessen-szene-Feed liefert keinen
+ * Vorverkaufsstart, Google möchte in `offers` aber ein `validFrom`. Wir merken
+ * uns deshalb pro Slug den Tag, an dem ein Termin zum ersten Mal im Feed
+ * aufgetaucht ist – ab da war er bei uns buchbar. Das Datum bleibt über alle
+ * weiteren Crawls hinweg stabil.
+ */
+const DASRIND_SCHEMA_FIRST_SEEN_OPTION = 'dasrind_schema_first_seen';
+
+/** Wie lange ein Eintrag erhalten bleibt, nachdem der Termin aus dem Feed fiel. */
+const DASRIND_SCHEMA_FIRST_SEEN_TTL_DAYS = 120;
+
+/** Obergrenze für die Ablage, damit sie nicht unbegrenzt wächst. */
+const DASRIND_SCHEMA_FIRST_SEEN_MAX = 600;
+
 
 // =============================================================================
 // GEMEINSAMER ZUGRIFF AUF DAS AKTUELLE EVENT
@@ -131,6 +146,110 @@ function dasrind_schema_current_event() {
 
 
 // =============================================================================
+// ERSTSICHTUNG (Grundlage für offers.validFrom)
+// =============================================================================
+
+/**
+ * Die Ablage Slug => 'Y-m-d'. Wird pro Request einmal gelesen.
+ *
+ * @param array|null $replace Neuen Stand übernehmen (nur intern nach dem Schreiben).
+ */
+function dasrind_schema_first_seen_map( ?array $replace = null ) {
+	static $map = null;
+
+	if ( null !== $replace ) {
+		$map = $replace;
+	}
+	if ( null === $map ) {
+		$stored = get_option( DASRIND_SCHEMA_FIRST_SEEN_OPTION, array() );
+		$map    = is_array( $stored ) ? $stored : array();
+	}
+
+	return $map;
+}
+
+/**
+ * Neue Termine mit dem heutigen Datum aufnehmen und – wenn der komplette Feed
+ * vorlag – alte Einträge aufräumen. Geschrieben wird nur, wenn sich etwas
+ * geändert hat: im Normalfall also gar nicht.
+ *
+ * @param array $events Feed-Einträge.
+ * @param bool  $prune  Nur true, wenn $events der vollständige Feed ist.
+ */
+function dasrind_schema_sync_first_seen( array $events, $prune = false ) {
+	$map    = dasrind_schema_first_seen_map();
+	$before = $map;
+	$today  = current_time( 'Y-m-d' );
+
+	$current = array();
+	foreach ( $events as $event ) {
+		$slug = isset( $event['slug'] ) ? (string) $event['slug'] : '';
+		if ( '' === $slug ) {
+			continue;
+		}
+		$current[ $slug ] = true;
+		if ( empty( $map[ $slug ] ) || ! preg_match( '/^\d{4}-\d{2}-\d{2}$/', (string) $map[ $slug ] ) ) {
+			$map[ $slug ] = $today;
+		}
+	}
+
+	// Aufräumen nur mit vollständigem, nicht leerem Feed – ein gestörter Feed
+	// darf die Ablage nicht leerräumen und damit alle Daten neu setzen.
+	if ( $prune && $current ) {
+		$deadline = wp_date( 'Y-m-d', strtotime( '-' . (int) DASRIND_SCHEMA_FIRST_SEEN_TTL_DAYS . ' days', current_time( 'timestamp' ) ) );
+		foreach ( $map as $slug => $date ) {
+			if ( isset( $current[ $slug ] ) ) {
+				continue;
+			}
+			if ( (string) $date < $deadline ) {
+				unset( $map[ $slug ] );
+			}
+		}
+		if ( count( $map ) > DASRIND_SCHEMA_FIRST_SEEN_MAX ) {
+			asort( $map ); // älteste zuerst
+			$map = array_slice( $map, -DASRIND_SCHEMA_FIRST_SEEN_MAX, null, true );
+		}
+	}
+
+	if ( $map !== $before ) {
+		update_option( DASRIND_SCHEMA_FIRST_SEEN_OPTION, $map, false );
+		dasrind_schema_first_seen_map( $map );
+	}
+}
+
+/**
+ * `validFrom` für die Angebote eines Termins: der Tag der Erstsichtung als
+ * ISO-8601-Zeitpunkt in der Zeitzone der Website.
+ *
+ * @return string Leer, wenn sich kein sinnvolles Datum bilden lässt.
+ */
+function dasrind_schema_valid_from( array $event ) {
+	$slug = isset( $event['slug'] ) ? (string) $event['slug'] : '';
+	$map  = dasrind_schema_first_seen_map();
+
+	$seen = ( '' !== $slug && ! empty( $map[ $slug ] ) )
+		? (string) $map[ $slug ]
+		: current_time( 'Y-m-d' );
+
+	// Niemals nach dem Termin selbst – sonst behauptet das Schema, der Verkauf
+	// habe erst nach der Veranstaltung begonnen.
+	if ( ! empty( $event['date_raw'] ) && $seen > (string) $event['date_raw'] ) {
+		$seen = (string) $event['date_raw'];
+	}
+
+	try {
+		// Wie beim startDate: über DateTimeImmutable mit wp_timezone(), damit
+		// die Sommer-/Winterzeit-Verschiebung stimmt.
+		$stamp = new DateTimeImmutable( $seen . ' 00:00:00', wp_timezone() );
+	} catch ( Exception $e ) {
+		return '';
+	}
+
+	return $stamp->format( 'c' );
+}
+
+
+// =============================================================================
 // AUSGABE
 // =============================================================================
 
@@ -145,6 +264,7 @@ function dasrind_schema_output() {
 	if ( ! empty( $_GET['event'] ) ) {
 		$event = dasrind_schema_current_event();
 		if ( $event ) {
+			dasrind_schema_sync_first_seen( array( $event ) );
 			$node = dasrind_schema_build_event( $event );
 			if ( $node ) {
 				dasrind_schema_print( $node );
@@ -161,8 +281,11 @@ function dasrind_schema_output() {
 	$items    = array();
 	$position = 0;
 	$today    = current_time( 'Y-m-d' );
+	$all      = hessens_fetch_events();
 
-	foreach ( hessens_fetch_events() as $event ) {
+	dasrind_schema_sync_first_seen( $all, true );
+
+	foreach ( $all as $event ) {
 		if ( empty( $event['date_raw'] ) || $event['date_raw'] < $today ) {
 			continue; // Vergangenes gehört nicht in die Liste
 		}
@@ -370,6 +493,13 @@ function dasrind_schema_build_offers( array $event, $url ) {
 	);
 	if ( $url ) {
 		$base['url'] = $url;
+	}
+
+	// Der Feed kennt keinen Vorverkaufsstart. Google mahnt `validFrom` aber an,
+	// deshalb der Tag der Erstsichtung im Feed (siehe oben).
+	$valid_from = dasrind_schema_valid_from( $event );
+	if ( '' !== $valid_from ) {
+		$base['validFrom'] = $valid_from;
 	}
 
 	if ( false !== stripos( $price_text, 'frei' ) ) {

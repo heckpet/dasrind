@@ -290,6 +290,24 @@ Die Beträge werden aus dem aufbereiteten `price`-String zurückgewonnen:
 
 `sold_out` aus dem Feed setzt die Verfügbarkeit auf `SoldOut`.
 
+### `validFrom` (Verkaufsstart)
+
+Die Search Console meldete am 26.08.2026 „Feld validFrom fehlt (in offers)" —
+ein nicht kritischer Hinweis, der die Rich Results nicht blockiert, aber
+irgendwann kritisch werden kann. Der hessen-szene-Feed liefert keinen
+Vorverkaufsstart, deshalb merkt sich das Plugin in der Option
+`dasrind_schema_first_seen` (`autoload = false`) pro Slug den Tag, an dem ein
+Termin **zum ersten Mal im Feed auftauchte**, und gibt ihn als `validFrom` aus.
+
+* Stabil über alle Crawls hinweg — das Datum wird nur einmal gesetzt.
+* Geschrieben wird nur, wenn sich etwas ändert; auf `/programm/` läuft dabei
+  zusätzlich das Aufräumen (`DASRIND_SCHEMA_FIRST_SEEN_TTL_DAYS`, Standard 120
+  Tage nach dem Verschwinden aus dem Feed, Obergrenze
+  `DASRIND_SCHEMA_FIRST_SEEN_MAX`).
+* Ein leerer oder gestörter Feed räumt die Ablage **nicht** leer.
+* Liegt die Erstsichtung nach dem Termin (Altbestand), wird auf das Eventdatum
+  gedeckelt.
+
 ## Bilder
 
 Für das Schema wird **Querformat zuerst** ausgegeben (`image2` vor `image1`) —

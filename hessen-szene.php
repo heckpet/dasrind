@@ -1,21 +1,55 @@
 <?php
 /**
- * truncate_html
- * Kürzt HTML-Inhalt auf eine bestimmte Zeichenanzahl (sichtbare Zeichen),
- * behält HTML-Struktur bei und entfernt überschüssige Nodes korrekt.
+ * hessens_truncate_html
+ * Kürzt HTML-Inhalt auf eine bestimmte Zeichenanzahl (sichtbare Zeichen).
+ * Gibt reinen Text zurück (kein HTML), schneidet an Wortgrenzen ab und
+ * ersetzt Block-/Umbruch-Tags durch Leerzeichen, damit aus mehreren
+ * Absätzen bzw. <br>-getrennten Links keine zusammengeklebten
+ * Endlos-Wörter entstehen.
  */
-function truncate_html($html, $maxLength = 200, $suffix = '...') {
-    // Tags entfernen, nur sichtbaren Text
-    $text = wp_strip_all_tags( $html );
-    // Mehrfache Leerzeichen/Zeilenumbrüche bereinigen
-    $text = preg_replace('/\s+/', ' ', $text);
-    $text = trim($text);
+function hessens_truncate_html( $html, $maxLength = 200, $suffix = '...' ) {
+    $text = (string) $html;
 
-    if ( mb_strlen($text) <= $maxLength ) {
+    // Block- und Umbruch-Tags VOR dem Strippen in Leerzeichen wandeln.
+    // Der Feed liefert die Kuenstler-Links als
+    // <p><a>...</a><br><a>...</a></p>; strip_tags() wuerde daraus ein
+    // einziges unteilbares Wort machen (z. B. 146 Zeichen bei TRAITRS),
+    // das in der Karten-Ansicht das Grid sprengt.
+    // WICHTIG: In diesem Muster darf die Zeichenfolge Fragezeichen+groesser
+    // NICHT vorkommen - WPCodeBox wertet sie als PHP-Ende und zerlegt das
+    // Snippet. Deshalb Ende ueber eine negierte Zeichenklasse loesen.
+    $text = preg_replace( '#<(?:br|hr)\b[^>]*>#i', ' ', $text );
+    $text = preg_replace(
+        '#</?(?:p|div|li|ul|ol|dl|dt|dd|tr|td|th|table|h[1-6]|blockquote|section|article|figure|figcaption|address)\b[^>]*>#i',
+        ' ',
+        $text
+    );
+
+    // Tags entfernen, nur sichtbaren Text
+    $text = wp_strip_all_tags( $text );
+
+    // Entities aufloesen (&amp;, &nbsp;, &#8222; ...) und danach erneut
+    // absichern, damit dekodierte spitze Klammern kein Markup ergeben.
+    $text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+    $text = wp_strip_all_tags( $text );
+
+    // Geschuetzte Leerzeichen und Mehrfach-Whitespace bereinigen
+    $text = str_replace( "\xC2\xA0", ' ', $text );
+    $text = preg_replace( '/\s+/u', ' ', $text );
+    $text = trim( $text );
+
+    if ( mb_strlen( $text ) <= $maxLength ) {
         return $text;
     }
 
-    return mb_substr($text, 0, $maxLength) . $suffix;
+    // Nicht mitten im Wort abschneiden
+    $cut = mb_substr( $text, 0, $maxLength );
+    $pos = mb_strrpos( $cut, ' ' );
+    if ( false !== $pos && $pos > (int) ( $maxLength * 0.6 ) ) {
+        $cut = mb_substr( $cut, 0, $pos );
+    }
+
+    return rtrim( $cut, " \t,;:.-" ) . $suffix;
 }
 
 
@@ -217,7 +251,7 @@ function hessens_fetch_events( $force = false ) {
         $description_long = wp_kses_post( trim( (string) $event->Description ) );
 
         // Kurzbeschreibung: 200 Zeichen, HTML-sicher
-        $description_short = truncate_html( $description_long, 200, '...' );
+        $description_short = hessens_truncate_html( $description_long, 200, '...' );
 
         // Ausverkauft
         $sold_out = ( ! empty( (string) $event->soldOut ) ) ? '1' : '0';

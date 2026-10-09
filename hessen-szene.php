@@ -1,828 +1,206 @@
 <?php
 /**
- * hessens_truncate_html
- * Kürzt HTML-Inhalt auf eine bestimmte Zeichenanzahl (sichtbare Zeichen).
- * Gibt reinen Text zurück (kein HTML), schneidet an Wortgrenzen ab und
- * ersetzt Block-/Umbruch-Tags durch Leerzeichen, damit aus mehreren
- * Absätzen bzw. <br>-getrennten Links keine zusammengeklebten
- * Endlos-Wörter entstehen.
- */
-function hessens_truncate_html( $html, $maxLength = 200, $suffix = '...' ) {
-    $text = (string) $html;
-
-    // Block- und Umbruch-Tags VOR dem Strippen in Leerzeichen wandeln.
-    // Der Feed liefert die Kuenstler-Links als
-    // <p><a>...</a><br><a>...</a></p>; strip_tags() wuerde daraus ein
-    // einziges unteilbares Wort machen (z. B. 146 Zeichen bei TRAITRS),
-    // das in der Karten-Ansicht das Grid sprengt.
-    // WICHTIG: In diesem Muster darf die Zeichenfolge Fragezeichen+groesser
-    // NICHT vorkommen - WPCodeBox wertet sie als PHP-Ende und zerlegt das
-    // Snippet. Deshalb Ende ueber eine negierte Zeichenklasse loesen.
-    $text = preg_replace( '#<(?:br|hr)\b[^>]*>#i', ' ', $text );
-    $text = preg_replace(
-        '#</?(?:p|div|li|ul|ol|dl|dt|dd|tr|td|th|table|h[1-6]|blockquote|section|article|figure|figcaption|address)\b[^>]*>#i',
-        ' ',
-        $text
-    );
-
-    // Tags entfernen, nur sichtbaren Text
-    $text = wp_strip_all_tags( $text );
-
-    // Entities aufloesen (&amp;, &nbsp;, &#8222; ...) und danach erneut
-    // absichern, damit dekodierte spitze Klammern kein Markup ergeben.
-    $text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-    $text = wp_strip_all_tags( $text );
-
-    // Geschuetzte Leerzeichen und Mehrfach-Whitespace bereinigen
-    $text = str_replace( "\xC2\xA0", ' ', $text );
-    $text = preg_replace( '/\s+/u', ' ', $text );
-    $text = trim( $text );
-
-    if ( mb_strlen( $text ) <= $maxLength ) {
-        return $text;
-    }
-
-    // Nicht mitten im Wort abschneiden
-    $cut = mb_substr( $text, 0, $maxLength );
-    $pos = mb_strrpos( $cut, ' ' );
-    if ( false !== $pos && $pos > (int) ( $maxLength * 0.6 ) ) {
-        $cut = mb_substr( $cut, 0, $pos );
-    }
-
-    return rtrim( $cut, " \t,;:.-" ) . $suffix;
-}
-
-
-/**
- * Hessen-Szene Event Feed - Etch Dynamic Data + JSON Endpoint
- * Fetcht XML, cached als Transient, stellt JSON-Endpoint bereit.
+ * Presse-Bild-Download für Das Rind
  *
- * CACHING-STRATEGIE
- * -----------------
- * Der Cache wird NICHT beim Seitenaufruf erneuert, sondern aktiv per WP-Cron
- * alle 15 Minuten. Die Transient-Laufzeit ist bewusst deutlich laenger
- * (2 Stunden) als das Cron-Intervall: So laeuft niemals ein Besucher in einen
- * abgelaufenen Cache und muss auf den langsamen Remote-Fetch warten – auch
- * dann nicht, wenn WP-Cron mal aussetzt (passiert auf Seiten mit wenig
- * Traffic regelmaessig).
+ * Der Download behält IMMER den Original-Dateinamen, unter dem das Bild von
+ * hessen-szene.de kommt (dort sind teilweise Urheber-Hinweise enthalten).
+ * Es wird kein sprechender Name mehr generiert.
  *
- * Zusaetzlich koennen Redakteure (Rolle: Editor) den Feed jederzeit manuell
- * ueber die Admin-Bar aktualisieren – siehe Abschnitt 2b.
- */
-
-// =============================================================================
-// 1. XML FETCH & PARSE
-// =============================================================================
-
-// Wie lange der Event-Cache maximal gilt (Sicherheitsnetz, falls Cron ausfaellt).
-if ( ! defined( 'HESSENS_CACHE_TTL' ) ) {
-    define( 'HESSENS_CACHE_TTL', 2 * HOUR_IN_SECONDS );
-}
-// In diesem Intervall erneuert der Cron den Feed aktiv.
-if ( ! defined( 'HESSENS_REFRESH_INTERVAL' ) ) {
-    define( 'HESSENS_REFRESH_INTERVAL', 15 * MINUTE_IN_SECONDS );
-}
-// Dauerhafte Sicherungskopie der zuletzt erfolgreich geladenen Events.
-// Wird ausgeliefert, wenn hessen-szene.de gerade nicht erreichbar ist –
-// damit die Programmseite nie leer ist.
-if ( ! defined( 'HESSENS_BACKUP_OPTION' ) ) {
-    define( 'HESSENS_BACKUP_OPTION', 'hessens_events_backup' );
-}
-
-/**
- * Laedt die Events.
+ * Zwei Aufrufvarianten:
  *
- * @param bool $force true = Cache ignorieren und frisch vom Server holen.
- * @return array
+ *   1. EMPFOHLEN – Slug + Bildnummer:
+ *      /?download_event_image=EVENT-SLUG&img=1
+ *      Liefert immer das hi-res Original.
+ *
+ *   2. Kompatibilität – direkte Bild-URL:
+ *      /?download_event_image=https://...
+ *      Erlaubt sind hessen-szene.de sowie der eigene Uploads-Ordner.
  */
-function hessens_fetch_events( $force = false ) {
-    $transient_key = 'hessens_events_feed';
 
-    if ( ! $force ) {
-        $cached = get_transient( $transient_key );
-        if ( $cached !== false ) {
-            return $cached;
-        }
-    }
+// -----------------------------------------------------------------------------
+// Helfer: Original-Dateinamen aus der Quell-URL übernehmen
+// -----------------------------------------------------------------------------
 
-    $feed_url = 'https://www.hessen-szene.de/cdn?type=151&tx_laks_calendar%5Baction%5D=xml&tx_laks_calendar%5Bcenter%5D=11&tx_laks_calendar%5BenableHtml%5D=1';
-    $response = wp_remote_get( $feed_url, array( 'timeout' => 15 ) );
+/**
+ * Gibt den Dateinamen exakt so zurück, wie er in der Quell-URL steht.
+ * Es wird nur das Nötigste entfernt (Pfadanteile, Steuerzeichen, Anführungs-
+ * zeichen), damit der Content-Disposition-Header nicht manipulierbar ist.
+ * Umlaute, Klammern, Unterstriche, Urheber-Hinweise usw. bleiben erhalten.
+ */
+function hessens_original_download_filename( $source_url ) {
+	$path = (string) parse_url( $source_url, PHP_URL_PATH );
+	$name = rawurldecode( basename( $path ) );
 
-    // Harter Fehler -> letzte bekannte Daten weiterverwenden statt leere Seite.
-    if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
-        return hessens_get_backup_events();
-    }
+	// Pfad-Traversal und Header-Injection unterbinden.
+	$name = str_replace( array( '\\', '/', '"', "\r", "\n", "\0" ), '', $name );
+	$name = trim( $name );
 
-    $xml_string = wp_remote_retrieve_body( $response );
+	// Fallback, falls die URL keinen brauchbaren Dateinamen enthält.
+	if ( $name === '' || $name === '.' || $name === '..' ) {
+		$name = 'download.jpg';
+	}
 
-    libxml_use_internal_errors( true );
-    $xml = simplexml_load_string( $xml_string );
-
-    if ( ! $xml ) {
-        return hessens_get_backup_events();
-    }
-
-    $events     = array();
-    $image_base = 'https://www.hessen-szene.de';
-
-    foreach ( $xml->Event as $event ) {
-
-        // Kategorien + Thema (letztes Wort des ersten Kategorietitels)
-        $categories = array();
-        $thema      = '';
-        if ( isset( $event->Categories->Category ) ) {
-            foreach ( $event->Categories->Category as $cat ) {
-                $cat_title    = (string) $cat->Title;
-                $categories[] = $cat_title;
-                if ( $thema === '' ) {
-                    $words = explode( ' ', trim( $cat_title ) );
-                    $thema = end( $words );
-                }
-            }
-        }
-
-        // Eintrittspreis
-        $price  = '';
-        $no_fee = ( (string) $event->noFee === '1' );
-        if ( $no_fee ) {
-            $price = 'Eintritt frei';
-        } elseif ( ! empty( (string) $event->FeeAdvanced ) ) {
-            $price = 'VVK: ' . (string) $event->FeeAdvanced . ' EUR (zzgl. VVK-Gebühr)';
-            if ( ! empty( (string) $event->FeeRegular ) ) {
-                $price .= ' / AK: ' . (string) $event->FeeRegular . ' EUR';
-            }
-        } elseif ( ! empty( (string) $event->FeeRegular ) ) {
-            $price = 'AK: ' . (string) $event->FeeRegular . ' EUR';
-        }
-
-        // Datum formatiert
-        $raw_date       = (string) $event->StartDate->Value;
-        $timestamp      = strtotime( $raw_date );
-        $date_formatted = $timestamp ? wp_date( 'D, j. M Y', $timestamp ) : $raw_date;
-
-
-        // Uhrzeit
-        $start_time_raw = (string) $event->StartTime->Value;
-        $start_time     = ( strlen( $start_time_raw ) >= 5 ) ? substr( $start_time_raw, 0, 5 ) : $start_time_raw;
-
-        // Einlasszeit
-        $box_office_start_time_raw = (string) $event->BoxOfficeStartTime->Value;
-        $box_office_start_time     = ( strlen( $box_office_start_time_raw ) >= 5 )
-            ? '- Einlass: ' . substr( $box_office_start_time_raw, 0, 5 )
-            : '';
-
-        // Bilder: alle durchnummeriert einsammeln (Image1, Image2, Image3, ...)
-        //
-        // Pro Bild werden zwei Varianten bereitgestellt:
-        //   image{N}_url        -> low-res (max. 800px) fuer die Anzeige in
-        //                          Programmuebersicht und Detailseiten.
-        //   image{N}_url_hires  -> Original aus dem XML (hi-res) fuer den
-        //                          Presse-Download-Bereich.
-        // Die low-res Datei wird im Hintergrund erzeugt (siehe Abschnitt 1b).
-        // Solange sie noch nicht existiert, liefert image{N}_url als Fallback
-        // das Original aus, damit nie ein kaputtes Bild angezeigt wird.
-        //
-        // WICHTIG - die Slot-Nummer bleibt erhalten:
-        //   Image1 = Hochformat (Portrait), ist nicht immer vorhanden.
-        //   Image2 = Querformat (Landscape), wird immer gepflegt.
-        // Die XML-Nummerierung hat also Luecken: ein Event kann <Image2>
-        // liefern, ohne dass <Image1> existiert. Es wird NICHT umnummeriert -
-        // Image2 bleibt image2. Fehlende Slots werden als leere Strings
-        // ausgegeben, damit die Felder in Etch immer existieren.
-        //
-        // Zusaetzlich liefert image_main_* das erste tatsaechlich vorhandene
-        // Bild (Portrait bevorzugt, sonst Landscape) - dieses Feld ist fuer
-        // die Anzeige in Programmuebersicht/Karten gedacht, damit nie ein
-        // leeres src entsteht.
-        $image_fields = array();
-        $img_paths    = array();
-        $max_slot     = 2; // mind. Slot 1 und 2 immer ausgeben
-        foreach ( $event->children() as $child ) {
-            if ( ! preg_match( '/^Image(\d+)$/', $child->getName(), $m ) ) {
-                continue;
-            }
-            $slot = (int) $m[1];
-            if ( $slot < 1 ) {
-                continue;
-            }
-            $max_slot = max( $max_slot, $slot );
-            $img_path = trim( (string) $child->PublicUrl );
-            if ( '' !== $img_path ) {
-                $img_paths[ $slot ] = $img_path;
-            }
-        }
-
-        $main_url = $main_hires = $main_name = '';
-        for ( $i = 1; $i <= $max_slot; $i++ ) {
-            if ( isset( $img_paths[ $i ] ) ) {
-                $img_path     = $img_paths[ $i ];
-                $original_url = $image_base . $img_path;
-                $image_fields[ 'image' . $i . '_url_hires' ] = $original_url;                              // Original (Presse-Download)
-                $image_fields[ 'image' . $i . '_url' ]       = hessens_lowres_display_url( $original_url ); // low-res (Anzeige)
-                $image_fields[ 'image' . $i . '_filename' ]  = basename( $img_path );
-                if ( '' === $main_url ) {
-                    $main_url   = $image_fields[ 'image' . $i . '_url' ];
-                    $main_hires = $image_fields[ 'image' . $i . '_url_hires' ];
-                    $main_name  = $image_fields[ 'image' . $i . '_filename' ];
-                }
-            } else {
-                $image_fields[ 'image' . $i . '_url_hires' ] = '';
-                $image_fields[ 'image' . $i . '_url' ]       = '';
-                $image_fields[ 'image' . $i . '_filename' ]  = '';
-            }
-        }
-
-        $image_fields['image_main_url']       = $main_url;
-        $image_fields['image_main_url_hires'] = $main_hires;
-        $image_fields['image_main_filename']  = $main_name;
-
-        // Location
-        $location_name   = '';
-        $location_street = '';
-        $location_city   = '';
-        if ( isset( $event->Locations->Location ) ) {
-            $loc             = $event->Locations->Location;
-            $location_name   = (string) $loc->Title;
-            $location_street = (string) $loc->Street;
-            $location_city   = trim( (string) $loc->Zip . ' ' . (string) $loc->City );
-        }
-
-        // Langbeschreibung: HTML behalten, nur sicher bereinigen
-        $description_long = wp_kses_post( trim( (string) $event->Description ) );
-
-        // Kurzbeschreibung: 200 Zeichen, HTML-sicher
-        $description_short = hessens_truncate_html( $description_long, 200, '...' );
-
-        // Ausverkauft
-        $sold_out = ( ! empty( (string) $event->soldOut ) ) ? '1' : '0';
-
-        // Kuenstler-Links (Homepage, Facebook, Instagram)
-        //
-        // Im XML liegen die Links unter <Links><Link><Title>/<URI>.
-        // Die Titel sind fest ("Homepage", "Facebook", "Instagram"); wir
-        // ordnen sie per Titel zu (Reihenfolge egal) und liefern feste
-        // Schluessel, die in Etch immer existieren – auch wenn ein Link fehlt.
-        $link_homepage  = '';
-        $link_facebook  = '';
-        $link_instagram = '';
-        if ( isset( $event->Links->Link ) ) {
-            foreach ( $event->Links->Link as $link ) {
-                $link_title = strtolower( trim( (string) $link->Title ) );
-                $link_uri   = trim( (string) $link->URI );
-                if ( $link_title === 'homepage' ) {
-                    $link_homepage = $link_uri;
-                } elseif ( $link_title === 'facebook' ) {
-                    $link_facebook = $link_uri;
-                } elseif ( $link_title === 'instagram' ) {
-                    $link_instagram = $link_uri;
-                }
-            }
-        }
-
-        // Slug
-        $slug = sanitize_title( $raw_date . '-' . (string) $event->Title );
-
-        // Basis-Event-Array
-        $event_data = array(
-            'id'                    => (string) $event->Id,
-            'title'                 => (string) $event->Title,
-            'slug'                  => $slug,
-            'date'                  => $date_formatted,
-            'date_raw'              => $raw_date,
-            'start_time'            => $start_time,
-            'box_office_start_time' => $box_office_start_time,
-            'categories'            => implode( ', ', $categories ),
-            'thema'                 => $thema,
-            'price'                 => $price,
-            'description'           => $description_short,
-            'long_description'      => $description_long,
-            'location_name'         => $location_name,
-            'location_street'       => $location_street,
-            'location_city'         => $location_city,
-            'sold_out'              => $sold_out,
-            'link_homepage'         => $link_homepage,
-            'link_facebook'         => $link_facebook,
-            'link_instagram'        => $link_instagram,
-            'month' => $timestamp ? wp_date( 'Y-m', $timestamp ) : '',
-            'month_label' => $timestamp ? wp_date( 'F Y', $timestamp ) : '',
-        );
-
-        // Bilder zusammenfuehren
-        $event_data = array_merge( $event_data, $image_fields );
-
-        $events[] = $event_data;
-    }
-
-    set_transient( $transient_key, $events, HESSENS_CACHE_TTL );
-
-    // Sicherungskopie mitschreiben (autoload = false, damit sie nicht bei
-    // jedem Seitenaufruf mitgeladen wird).
-    update_option( HESSENS_BACKUP_OPTION, $events, false );
-
-    // Zeitstempel des letzten erfolgreichen Abrufs merken (fuer die Anzeige).
-    update_option( 'hessens_last_refresh', time(), false );
-
-    return $events;
+	return $name;
 }
 
 /**
- * Letzte erfolgreich geladene Events aus der Sicherungskopie.
+ * Setzt den Content-Disposition-Header. Zusätzlich zur ASCII-Variante wird
+ * filename* (RFC 5987) gesendet, damit Umlaute im Original-Namen erhalten
+ * bleiben.
  */
-function hessens_get_backup_events() {
-    $backup = get_option( HESSENS_BACKUP_OPTION );
+function hessens_send_disposition_header( $filename ) {
+	$ascii = remove_accents( $filename );
+	$ascii = preg_replace( '/[^\x20-\x7E]/', '_', $ascii );
 
-    return is_array( $backup ) ? $backup : array();
-}
-
-
-// =============================================================================
-// 1b. BILD-VERARBEITUNG (low-res Cache)
-//     Erzeugt aus den (kuenftig hi-res) Original-Fotos verkleinerte Kopien
-//     mit max. 800px Kantenlaenge und legt sie dauerhaft im Uploads-Ordner ab.
-//     Die Verarbeitung laeuft im Hintergrund (WP-Cron), nicht beim Seitenaufruf.
-// =============================================================================
-
-// Unterordner im Uploads-Verzeichnis, in dem die low-res Dateien liegen.
-if ( ! defined( 'HESSENS_LOWRES_DIR' ) ) {
-    define( 'HESSENS_LOWRES_DIR', 'hessens-events' );
-}
-// Maximale Kantenlaenge der low-res Variante (Breite ODER Hoehe).
-if ( ! defined( 'HESSENS_LOWRES_MAX' ) ) {
-    define( 'HESSENS_LOWRES_MAX', 800 );
+	header(
+		'Content-Disposition: attachment; filename="' . $ascii . '"; '
+		. "filename*=UTF-8''" . rawurlencode( $filename )
+	);
 }
 
 /**
- * Liefert Datei-Pfad und URL der low-res Variante zu einer Original-URL.
- * Der Dateiname ist ein eindeutiger Hash der Original-URL.
+ * Sucht das Event, zu dem eine Bild-URL gehört (hi-res oder low-res).
+ * Gibt array( $event, $index ) zurück oder array( null, 1 ).
  */
-function hessens_lowres_paths( $original_url ) {
-    $upload    = wp_upload_dir();
-    $path_part = (string) parse_url( $original_url, PHP_URL_PATH );
-    $ext       = strtolower( pathinfo( $path_part, PATHINFO_EXTENSION ) );
+function hessens_find_event_by_image_url( $url ) {
+	foreach ( hessens_fetch_events() as $event ) {
+		$i = 1;
+		while ( isset( $event[ 'image' . $i . '_url_hires' ] ) ) {
+			if ( $event[ 'image' . $i . '_url_hires' ] === $url || ( isset( $event[ 'image' . $i . '_url' ] ) && $event[ 'image' . $i . '_url' ] === $url ) ) {
+				return array( $event, $i );
+			}
+			$i++;
+		}
+	}
 
-    if ( ! in_array( $ext, array( 'jpg', 'jpeg', 'png', 'gif', 'webp' ), true ) ) {
-        $ext = 'jpg';
-    }
-
-    $filename = md5( $original_url ) . '.' . $ext;
-
-    return array(
-        'path' => trailingslashit( $upload['basedir'] ) . HESSENS_LOWRES_DIR . '/' . $filename,
-        'url'  => trailingslashit( $upload['baseurl'] ) . HESSENS_LOWRES_DIR . '/' . $filename,
-    );
+	return array( null, 1 );
 }
 
-/**
- * Liefert die anzuzeigende Bild-URL:
- * - die low-res Datei, sobald sie erzeugt wurde
- * - sonst (Fallback) das Original, bis der Cron-Job nachzieht
- */
-function hessens_lowres_display_url( $original_url ) {
-    if ( empty( $original_url ) ) {
-        return '';
-    }
+// -----------------------------------------------------------------------------
+// Auslieferung
+// -----------------------------------------------------------------------------
 
-    $paths = hessens_lowres_paths( $original_url );
+function hessens_serve_image_download( $url ) {
+	$filename     = hessens_original_download_filename( $url );
+	$upload       = wp_upload_dir();
+	$local_prefix = trailingslashit( $upload['baseurl'] );
 
-    if ( file_exists( $paths['path'] ) ) {
-        return $paths['url'];
-    }
+	// a) Lokale Datei -> direkt vom Dateisystem ausliefern (kein HTTP-Umweg).
+	if ( strpos( $url, $local_prefix ) === 0 ) {
+		$file = realpath( trailingslashit( $upload['basedir'] ) . substr( $url, strlen( $local_prefix ) ) );
+		$base = realpath( $upload['basedir'] );
 
-    return $original_url;
+		if ( ! $file || ! $base || strpos( $file, $base ) !== 0 || ! is_file( $file ) ) {
+			wp_die( 'Datei nicht gefunden.' );
+		}
+
+		$type = wp_check_filetype( $file );
+
+		nocache_headers();
+		header( 'Content-Type: ' . ( $type['type'] ? $type['type'] : 'application/octet-stream' ) );
+		hessens_send_disposition_header( $filename );
+		header( 'Content-Length: ' . filesize( $file ) );
+		header( 'X-Content-Type-Options: nosniff' );
+		readfile( $file );
+		exit;
+	}
+
+	// b) Remote (hessen-szene.de) -> durchreichen.
+	$response = wp_remote_get( $url, array( 'timeout' => 25 ) );
+
+	if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
+		wp_die( 'Bild konnte nicht geladen werden.' );
+	}
+
+	$body         = wp_remote_retrieve_body( $response );
+	$content_type = wp_remote_retrieve_header( $response, 'content-type' );
+
+	nocache_headers();
+	header( 'Content-Type: ' . ( $content_type ? $content_type : 'application/octet-stream' ) );
+	hessens_send_disposition_header( $filename );
+	header( 'Content-Length: ' . strlen( $body ) );
+	header( 'X-Content-Type-Options: nosniff' );
+	echo $body;
+	exit;
 }
 
-/**
- * Erzeugt eine einzelne low-res Datei: Original herunterladen, auf
- * max. HESSENS_LOWRES_MAX px verkleinern (Seitenverhaeltnis bleibt erhalten)
- * und im Cache-Ordner ablegen. Gibt true zurueck, wenn die Datei vorliegt.
- */
-function hessens_generate_one_lowres( $original_url ) {
-    if ( empty( $original_url ) ) {
-        return false;
-    }
-
-    $paths = hessens_lowres_paths( $original_url );
-
-    // Schon vorhanden -> nichts zu tun.
-    if ( file_exists( $paths['path'] ) ) {
-        return true;
-    }
-
-    // Zielordner sicherstellen.
-    $dir = dirname( $paths['path'] );
-    if ( ! is_dir( $dir ) ) {
-        wp_mkdir_p( $dir );
-    }
-
-    // Original temporaer herunterladen.
-    require_once ABSPATH . 'wp-admin/includes/file.php';
-    $tmp = download_url( $original_url, 20 );
-    if ( is_wp_error( $tmp ) ) {
-        return false;
-    }
-
-    $size = @getimagesize( $tmp );
-    if ( ! $size ) {
-        @unlink( $tmp );
-        return false;
-    }
-
-    $width  = (int) $size[0];
-    $height = (int) $size[1];
-
-    // Bereits klein genug -> Original 1:1 in den Cache kopieren (kein Qualitaetsverlust).
-    if ( $width <= HESSENS_LOWRES_MAX && $height <= HESSENS_LOWRES_MAX ) {
-        $ok = copy( $tmp, $paths['path'] );
-        @unlink( $tmp );
-        return (bool) $ok;
-    }
-
-    // Verkleinern: passt das Bild in eine Box von MAX x MAX,
-    // Seitenverhaeltnis bleibt erhalten (landscape -> max. Breite,
-    // portrait -> max. Hoehe).
-    $editor = wp_get_image_editor( $tmp );
-    if ( is_wp_error( $editor ) ) {
-        @unlink( $tmp );
-        return false;
-    }
-
-    $editor->resize( HESSENS_LOWRES_MAX, HESSENS_LOWRES_MAX, false );
-    $editor->set_quality( 82 );
-    $saved = $editor->save( $paths['path'] );
-
-    @unlink( $tmp );
-
-    return ! is_wp_error( $saved );
-}
-
-/**
- * Verarbeitet fehlende low-res Bilder in Batches.
- * $limit begrenzt die Anzahl pro Aufruf, damit kein PHP-Timeout entsteht.
- * Gibt zurueck, wie viele Bilder erzeugt wurden und wie viele noch offen sind.
- */
-function hessens_process_images( $limit = 10 ) {
-    @set_time_limit( 0 );
-
-    $events    = hessens_fetch_events();
-    $processed = 0;
-    $remaining = 0;
-
-    foreach ( $events as $event ) {
-        $i = 1;
-        while ( isset( $event[ 'image' . $i . '_url_hires' ] ) ) {
-            $hires = $event[ 'image' . $i . '_url_hires' ];
-            $i++;
-
-            if ( empty( $hires ) ) {
-                continue;
-            }
-
-            $paths = hessens_lowres_paths( $hires );
-            if ( file_exists( $paths['path'] ) ) {
-                continue; // schon erledigt
-            }
-
-            // Batch-Grenze erreicht -> nur noch zaehlen.
-            if ( $processed >= $limit ) {
-                $remaining++;
-                continue;
-            }
-
-            if ( hessens_generate_one_lowres( $hires ) ) {
-                $processed++;
-            }
-        }
-    }
-
-    // Wenn neue Dateien erzeugt wurden, Event-Cache neu aufbauen,
-    // damit image{N}_url ab sofort auf die fertige low-res Datei zeigt.
-    if ( $processed > 0 ) {
-        hessens_fetch_events( true );
-    }
-
-    return array( 'processed' => $processed, 'remaining' => $remaining );
-}
-
-// --- WP-Cron: Feed und Bilder im Hintergrund aktualisieren -------------------
-
-// Eigenes 15-Minuten-Intervall registrieren.
-add_filter( 'cron_schedules', function ( $schedules ) {
-    if ( ! isset( $schedules['hessens_15min'] ) ) {
-        $schedules['hessens_15min'] = array(
-            'interval' => HESSENS_REFRESH_INTERVAL,
-            'display'  => 'Alle 15 Minuten (Hessen-Szene)',
-        );
-    }
-    return $schedules;
-} );
-
-// Cron-Events einplanen, falls noch nicht vorhanden.
-add_action( 'init', function () {
-    // Feed aktiv erneuern, damit der Cache immer warm ist.
-    if ( ! wp_next_scheduled( 'hessens_refresh_feed_event' ) ) {
-        wp_schedule_event( time() + 30, 'hessens_15min', 'hessens_refresh_feed_event' );
-    }
-    // Bilder nachverarbeiten.
-    if ( ! wp_next_scheduled( 'hessens_process_images_event' ) ) {
-        wp_schedule_event( time() + 60, 'hessens_15min', 'hessens_process_images_event' );
-    }
-} );
-
-// Feed-Refresh: holt das XML frisch und schreibt Cache + Sicherungskopie.
-add_action( 'hessens_refresh_feed_event', function () {
-    hessens_fetch_events( true );
-} );
-
-// Der eigentliche Bild-Job: pro Lauf max. 10 Bilder.
-add_action( 'hessens_process_images_event', function () {
-    hessens_process_images( 10 );
-} );
-
-// --- Manueller Trigger fuer die Bildverarbeitung (nur fuer Admins) -----------
-// Erstbefuellung nach dem Umstieg: deine-seite.de/?hessens_process_images=1
-add_action( 'init', function () {
-    if ( isset( $_GET['hessens_process_images'] ) && current_user_can( 'manage_options' ) ) {
-        $result = hessens_process_images( 200 );
-        wp_die( sprintf(
-            'Bilder verarbeitet: %d &middot; Noch offen: %d.<br>%s',
-            (int) $result['processed'],
-            (int) $result['remaining'],
-            $result['remaining'] > 0
-                ? 'Bitte diese Seite erneut aufrufen, um die restlichen Bilder zu erzeugen.'
-                : 'Alle low-res Bilder sind aktuell.'
-        ) );
-    }
-} );
-
-
-// =============================================================================
-// 2. CACHE LEEREN (nur fuer Admins: deine-seite.de/?clear_events_cache=1)
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Router
+// -----------------------------------------------------------------------------
 
 add_action( 'init', function () {
-    if ( isset( $_GET['clear_events_cache'] ) && current_user_can( 'manage_options' ) ) {
-        delete_transient( 'hessens_events_feed' );
-        wp_die( 'Event-Cache geleert.' );
-    }
-} );
 
+	if ( empty( $_GET['download_event_image'] ) ) {
+		return;
+	}
 
-// =============================================================================
-// 2b. MANUELLES AKTUALISIEREN FUER REDAKTEURE
-//     Admin-Bar-Eintrag "Veranstaltungen aktualisieren" – sichtbar ab der
-//     Rolle Editor (Capability edit_posts). Ein Klick holt den Feed sofort
-//     frisch von hessen-szene.de und meldet zurueck, wie viele Termine
-//     geladen wurden.
-// =============================================================================
+	$param = wp_unslash( $_GET['download_event_image'] );
+	$index = isset( $_GET['img'] ) ? max( 1, (int) $_GET['img'] ) : 1;
 
-/**
- * Eintrag in der Admin-Bar (Frontend und Backend).
- */
-add_action( 'admin_bar_menu', function ( $wp_admin_bar ) {
+	// ---------------------------------------------------------------------
+	// Variante 1: Slug übergeben (empfohlen)
+	// ---------------------------------------------------------------------
+	if ( strpos( $param, 'http' ) !== 0 ) {
 
-    if ( ! current_user_can( 'edit_posts' ) ) {
-        return;
-    }
+		$slug  = sanitize_title( $param );
+		$event = null;
 
-    // Zurueck-Ziel: die Seite, auf der man gerade ist.
-    $back = is_admin()
-        ? admin_url()
-        : home_url( isset( $_SERVER['REQUEST_URI'] ) ? wp_unslash( $_SERVER['REQUEST_URI'] ) : '/' );
+		foreach ( hessens_fetch_events() as $e ) {
+			if ( $e['slug'] === $slug ) {
+				$event = $e;
+				break;
+			}
+		}
 
-    $url = wp_nonce_url(
-        add_query_arg( 'hessens_refresh_events', '1', $back ),
-        'hessens_refresh_events'
-    );
+		if ( ! $event ) {
+			wp_die( 'Event nicht gefunden.' );
+		}
 
-    $last  = (int) get_option( 'hessens_last_refresh' );
-    $title = 'Veranstaltungen aktualisieren';
-    $meta  = array();
+		// hi-res bevorzugen, sonst low-res als Fallback
+		$url = '';
+		if ( ! empty( $event[ 'image' . $index . '_url_hires' ] ) ) {
+			$url = $event[ 'image' . $index . '_url_hires' ];
+		} elseif ( ! empty( $event[ 'image' . $index . '_url' ] ) ) {
+			$url = $event[ 'image' . $index . '_url' ];
+		}
 
-    if ( $last ) {
-        $meta['title'] = 'Zuletzt aktualisiert: ' . wp_date( 'd.m.Y, H:i', $last ) . ' Uhr';
-    }
+		if ( empty( $url ) ) {
+			wp_die( 'Für dieses Event ist kein Bild ' . (int) $index . ' vorhanden.' );
+		}
 
-    $wp_admin_bar->add_node( array(
-        'id'    => 'hessens-refresh',
-        'title' => $title,
-        'href'  => $url,
-        'meta'  => $meta,
-    ) );
+		hessens_serve_image_download( $url );
+	}
 
-}, 100 );
+	// ---------------------------------------------------------------------
+	// Variante 2: direkte URL (Kompatibilität)
+	// ---------------------------------------------------------------------
+	$url    = esc_url_raw( $param ); // KEIN urldecode – PHP hat bereits dekodiert
+	$upload = wp_upload_dir();
 
-/**
- * Der Aktualisierungs-Vorgang.
- */
-add_action( 'init', function () {
+	$allowed = array(
+		'https://www.hessen-szene.de/',
+		'https://hessen-szene.de/',
+		trailingslashit( $upload['baseurl'] ),
+	);
 
-    if ( empty( $_GET['hessens_refresh_events'] ) ) {
-        return;
-    }
+	$is_allowed = false;
+	foreach ( $allowed as $prefix ) {
+		if ( strpos( $url, $prefix ) === 0 ) {
+			$is_allowed = true;
+			break;
+		}
+	}
 
-    if ( ! current_user_can( 'edit_posts' ) ) {
-        wp_die( 'Keine Berechtigung zum Aktualisieren der Veranstaltungen.' );
-    }
+	if ( ! $is_allowed ) {
+		wp_die( 'Ungültige URL: ' . esc_html( $url ) );
+	}
 
-    // Schuetzt davor, dass der Aufruf ungewollt von aussen ausgeloest wird.
-    check_admin_referer( 'hessens_refresh_events' );
+	// Wenn eine low-res URL kommt: auf das hi-res Original hochstufen.
+	list( $event, $found_index ) = hessens_find_event_by_image_url( $url );
 
-    $events = hessens_fetch_events( true );
-    $count  = count( $events );
+	if ( $event && ! empty( $event[ 'image' . $found_index . '_url_hires' ] ) ) {
+		$url = $event[ 'image' . $found_index . '_url_hires' ];
+	}
 
-    // Neue Termine bringen oft neue Bilder mit: Verarbeitung gleich anstossen,
-    // aber im Hintergrund, damit der Redakteur nicht warten muss.
-    wp_schedule_single_event( time() + 20, 'hessens_process_images_event' );
-
-    $back = wp_get_referer();
-    if ( ! $back ) {
-        $back = home_url( '/' );
-    }
-    // Den Trigger-Parameter aus der Ruecksprung-URL entfernen.
-    $back = remove_query_arg( array( 'hessens_refresh_events', '_wpnonce' ), $back );
-
-    $message = $count > 0
-        ? sprintf( 'Es wurden <strong>%d Termine</strong> geladen.', $count )
-        : 'Es wurden <strong>keine Termine</strong> geladen. Bitte pruefen, ob auf hessen-szene.de Veranstaltungen freigegeben sind.';
-
-    wp_die(
-        '<p>' . $message . '</p>'
-        . '<p style="color:#555;font-size:13px;">Hinweis: Wenn eine gerade eingegebene Veranstaltung noch fehlt, '
-        . 'liegt das am Zwischenspeicher von hessen-szene.de. Bitte in ein paar Minuten erneut aktualisieren.</p>'
-        . '<p><a href="' . esc_url( $back ) . '">&laquo; Zurueck zur Seite</a></p>',
-        'Veranstaltungen aktualisiert',
-        array( 'response' => 200, 'back_link' => false )
-    );
-} );
-
-
-// =============================================================================
-// 3. ETCH DYNAMIC DATA HOOK
-// =============================================================================
-
-add_filter( 'etch/dynamic_data/option', function ( $data ) {
-    $data['events'] = hessens_fetch_events();
-    return $data;
-} );
-
-
-// =============================================================================
-// 4. JSON ENDPOINT (deine-seite.de/?hessens_events=1)
-//    Diese URL traegst du in Etch unter Loop > Source: JSON Data > URL ein.
-// =============================================================================
-
-add_action( 'init', function () {
-    if ( isset( $_GET['hessens_events'] ) ) {
-        header( 'Content-Type: application/json; charset=utf-8' );
-        header( 'Cache-Control: public, max-age=3600' );
-        header( 'Access-Control-Allow-Origin: *' );
-        echo json_encode( hessens_fetch_events(), JSON_UNESCAPED_UNICODE );
-        exit;
-    }
-} );
-
-
-// =============================================================================
-// 5. SINGLE EVENT: options.event (fuer die Detailseite)
-//    Liest ?event=SLUG aus der URL und gibt das passende Event zurueck.
-// =============================================================================
-
-add_filter( 'etch/dynamic_data/option', function ( $data ) {
-    if ( isset( $_GET['event'] ) && ! empty( $_GET['event'] ) ) {
-        $requested_slug = sanitize_title( $_GET['event'] );
-        $all_events     = hessens_fetch_events();
-        foreach ( $all_events as $event ) {
-            if ( $event['slug'] === $requested_slug ) {
-                $data['event'] = $event;
-                break;
-            }
-        }
-    }
-    return $data;
-} );
-
-
-// =============================================================================
-// 6. LIMITIERTER ENDPOINT
-//    Gibt nur die ersten N Events zurueck.
-// =============================================================================
-
-add_filter( 'etch/dynamic_data/option', function ( $data ) {
-    $data['events_preview'] = array_slice( hessens_fetch_events(), 0, 4 );
-    return $data;
-} );
-
-// =============================================================================
-// 7. iCAL ENDPOINT (deine-seite.de/?hessens_ical=EVENT-SLUG)
-// =============================================================================
-
-/**
- * Escaped einen Textwert nach RFC 5545: Backslash, Semikolon, Komma und
- * Zeilenumbrueche muessen maskiert werden, sonst zerlegen Kalender-Clients
- * das Feld an der falschen Stelle.
- */
-function hessens_ical_escape( $text ) {
-    $text = wp_strip_all_tags( (string) $text );
-    $text = str_replace( array( "\r\n", "\r" ), "\n", $text );
-    return str_replace(
-        array( '\\',   ';',   ',',   "\n" ),
-        array( '\\\\', '\\;', '\\,', '\\n' ),
-        $text
-    );
-}
-
-/**
- * Faltet eine Content-Line auf max. 75 Oktette (RFC 5545, "content line
- * folding"). Folgezeilen beginnen mit einem Leerzeichen. UTF-8-Zeichen
- * werden nie mittendrin getrennt.
- */
-function hessens_ical_fold( $line ) {
-    $out   = '';
-    $chunk = '';
-    $bytes = 0;
-    $limit = 74; // 74 Oktette + CRLF; Folgezeilen zaehlen das Leerzeichen mit
-    $len   = mb_strlen( $line, 'UTF-8' );
-
-    for ( $i = 0; $i < $len; $i++ ) {
-        $char       = mb_substr( $line, $i, 1, 'UTF-8' );
-        $char_bytes = strlen( $char );
-        if ( $bytes + $char_bytes > $limit ) {
-            $out  .= $chunk . "\r\n";
-            $chunk = ' ';
-            $bytes = 1;
-        }
-        $chunk .= $char;
-        $bytes += $char_bytes;
-    }
-
-    return $out . $chunk . "\r\n";
-}
-
-add_action( 'init', function () {
-    if ( isset( $_GET['hessens_ical'] ) && ! empty( $_GET['hessens_ical'] ) ) {
-        $requested_slug = sanitize_title( $_GET['hessens_ical'] );
-        $all_events     = hessens_fetch_events();
-        $event          = null;
-
-        foreach ( $all_events as $e ) {
-            if ( $e['slug'] === $requested_slug ) {
-                $event = $e;
-                break;
-            }
-        }
-
-        if ( ! $event ) {
-            wp_die( 'Event nicht gefunden.' );
-        }
-
-        // Datum + Zeit fuer iCAL formatieren (YYYYMMDDTHHmmssZ, also echte UTC).
-        //
-        // ACHTUNG - haeufige Fehlerquelle: WordPress setzt PHPs Default-Zeitzone
-        // auf UTC. Ein `strtotime( '2026-08-24 20:00' )` liest die Ortszeit
-        // deshalb als UTC, und `gmdate( ... 'Z' )` stempelt sie erneut als UTC -
-        // der Termin landet im Kalender um den Berlin-Offset verschoben
-        // (Sommerzeit +2 h, Winterzeit +1 h). Die Ortszeit muss daher explizit
-        // in der Site-Zeitzone konstruiert und danach nach UTC konvertiert
-        // werden.
-        $site_tz = wp_timezone(); // aus den WordPress-Einstellungen, DST-sicher
-        try {
-            $start_local = new DateTimeImmutable(
-                $event['date_raw'] . ' ' . $event['start_time'],
-                $site_tz
-            );
-        } catch ( Exception $e ) {
-            wp_die( 'Ungueltige Datums-/Zeitangabe im Feed.' );
-        }
-        // Ende: 3 Stunden nach Beginn als Schaetzwert
-        $end_local = $start_local->modify( '+3 hours' );
-
-        $utc            = new DateTimeZone( 'UTC' );
-        $start_datetime = $start_local->setTimezone( $utc )->format( 'Ymd\THis\Z' );
-        $end_datetime   = $end_local->setTimezone( $utc )->format( 'Ymd\THis\Z' );
-
-        $location = trim( $event['location_name'] . ', ' . $event['location_street'] . ', ' . $event['location_city'] );
-        $location = trim( $location, " ,\t\n\r\0\x0B" );
-        $uid      = $event['id'] . '@dasrind.de';
-
-        $ics = "BEGIN:VCALENDAR\r\n";
-        $ics .= "VERSION:2.0\r\n";
-        $ics .= "PRODID:-//Das Rind//Event//DE\r\n";
-        $ics .= "CALSCALE:GREGORIAN\r\n";
-        $ics .= "METHOD:PUBLISH\r\n";
-        $ics .= "BEGIN:VEVENT\r\n";
-        $ics .= "UID:" . $uid . "\r\n";
-        $ics .= "DTSTAMP:" . gmdate( 'Ymd\THis\Z' ) . "\r\n";
-        $ics .= "DTSTART:" . $start_datetime . "\r\n";
-        $ics .= "DTEND:" . $end_datetime . "\r\n";
-        $ics .= hessens_ical_fold( 'SUMMARY:' . hessens_ical_escape( $event['title'] ) );
-        $ics .= hessens_ical_fold( 'DESCRIPTION:' . hessens_ical_escape( $event['description'] ) );
-        $ics .= hessens_ical_fold( 'LOCATION:' . hessens_ical_escape( $location ) );
-        $ics .= "END:VEVENT\r\n";
-        $ics .= "END:VCALENDAR\r\n";
-
-        header( 'Content-Type: text/calendar; charset=utf-8' );
-        header( 'Content-Disposition: attachment; filename="' . $event['slug'] . '.ics"' );
-        echo $ics;
-        exit;
-    }
+	hessens_serve_image_download( $url );
 } );
